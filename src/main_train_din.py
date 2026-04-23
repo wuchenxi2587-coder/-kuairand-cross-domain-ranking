@@ -1,0 +1,637 @@
+"""
+DIN Baseline 训练主入口。
+
+使用方式:
+    python -m src.main_train_din \
+        --config configs/train_din_mem16gb.yaml \
+        --data_root output/processed \
+        --meta_root output/meta \
+        --vocabs_root output/vocabs \
+        --run_dir output/exp_runs/din_baseline \
+        --feature_mode all
+
+所有路径参数均可在 YAML 中配置，CLI 参数会覆盖 YAML 中的对应值。
+"""
+
+import argparse
+import json
+import logging
+import math
+import os
+import sys
+from pathlib import Path
+from typing import Dict, Optional
+
+import torch
+import yaml
+from torch.cuda.amp import GradScaler
+from torch.utils.data import DataLoader
+
+# ── 项目内部导入 ──
+from src.datasets.collate import BatchCollateFn, SampleCollateFn, reset_collate_print_flag
+from src.datasets.parquet_iterable_dataset import (
+    ParquetIterableDataset,
+    resolve_columns,
+)
+from src.metrics.metrics import compute_all_metrics
+from src.models.din import DINModel
+from src.trainers.train_din import (
+    evaluate,
+    is_better,
+    sanity_check_forward,
+    train_one_epoch,
+)
+from src.utils.checkpoint import (
+    load_checkpoint,
+    save_checkpoint,
+    save_config_snapshot,
+    save_final_metrics,
+)
+from src.utils.seed import set_seed
+
+logger = logging.getLogger("src")
+
+
+# ─────────────────────────────────────────────────────────────
+# CLI 参数
+# ─────────────────────────────────────────────────────────────
+
+def parse_args():
+    p = argparse.ArgumentParser(description="DIN Baseline 训练")
+    p.add_argument("--config", type=str, default="configs/train_din_mem16gb.yaml", help="YAML 配置文件路径")
+    p.add_argument("--data_root", type=str, default=None, help="覆盖 data.data_root")
+    p.add_argument("--meta_root", type=str, default=None, help="覆盖 data.meta_root")
+    p.add_argument("--vocabs_root", type=str, default=None, help="覆盖 data.vocabs_root")
+    p.add_argument("--run_dir", type=str, default=None, help="实验输出目录")
+    p.add_argument("--device", type=str, default=None, help="覆盖 device (auto/cuda/cpu)")
+    p.add_argument("--epochs", type=int, default=None, help="覆盖训练 epoch 数")
+    p.add_argument("--batch_size", type=int, default=None, help="覆盖训练 batch_size")
+    p.add_argument(
+        "--model_variant",
+        type=str,
+        default=None,
+        help="覆盖 model.variant: din / din_psrg / din_psrg_pcrg / din_psrg_pcrg_transformer",
+    )
+    p.add_argument("--num_queries", type=int, default=None, help="覆盖 model.pcrg.num_queries")
+    p.add_argument("--pcrg_aggregation", type=str, default=None, help="覆盖 model.pcrg.aggregation")
+    p.add_argument("--eval_only", action="store_true", help="仅评估（跳过训练，加载 best checkpoint）")
+    p.add_argument("--debug_rows", type=int, default=0, help=">0 时使用 DebugMapDataset 加载前 N 行")
+    p.add_argument(
+        "--feature_mode",
+        type=str,
+        default=None,
+        choices=["sparse", "dense", "all"],
+        help="特征选择模式: sparse=仅用Sparse分桶特征, dense=仅用Dense原始值特征, all=使用全部特征",
+    )
+    return p.parse_args()
+
+
+# ─────────────────────────────────────────────────────────────
+# 配置加载与合并
+# ─────────────────────────────────────────────────────────────
+
+def load_config(args) -> dict:
+    """加载 YAML 配置并用 CLI 参数覆盖对应字段。"""
+    with open(args.config, "r", encoding="utf-8") as f:
+        config = yaml.safe_load(f)
+
+    # 兼容别名：有些配置把 training 写成 train
+    if "training" not in config and "train" in config:
+        config["training"] = config["train"]
+
+    # 确保新增 ADS 子配置存在（便于 CLI override）
+    config.setdefault("model", {})
+    config["model"].setdefault("psrg", {})
+    config["model"].setdefault("pcrg", {})
+    config["model"].setdefault("transformer_fusion", {})
+    config["model"].setdefault("ppnet", {})
+
+    # CLI 覆盖
+    if args.data_root:
+        config["data"]["data_root"] = args.data_root
+    if args.meta_root:
+        config["data"]["meta_root"] = args.meta_root
+    if args.vocabs_root:
+        config["data"]["vocabs_root"] = args.vocabs_root
+    if args.device:
+        config["device"] = args.device
+    if args.epochs:
+        config["training"]["epochs"] = args.epochs
+    if args.batch_size:
+        config["training"]["batch_size"] = args.batch_size
+    if args.model_variant:
+        config["model"]["variant"] = args.model_variant
+    if args.num_queries is not None:
+        config["model"]["pcrg"]["num_queries"] = args.num_queries
+    if args.pcrg_aggregation:
+        config["model"]["pcrg"]["aggregation"] = args.pcrg_aggregation
+
+    # run_dir
+    run_name = config.get("run_name", "din_baseline")
+    if args.run_dir:
+        config["run_dir"] = args.run_dir
+    else:
+        config["run_dir"] = str(Path("output") / "exp_runs" / run_name)
+
+    return config
+
+
+# ─────────────────────────────────────────────────────────────
+# 特征选择 - 根据 feature_mode 动态调整 fields 配置
+# ─────────────────────────────────────────────────────────────
+
+def apply_feature_selection(config: dict, feature_mode: Optional[str]) -> dict:
+    """
+    根据 feature_mode 动态调整 fields 配置，控制是否添加物品统计特征。
+
+    注意：当前模型架构只支持 sparse embedding 特征，所有统计特征都通过分桶后嵌入处理。
+
+    Args:
+        config: 原始配置字典
+        feature_mode: sparse / dense / all / None
+            - sparse: 仅使用基础特征 + 统计特征的分桶版本 (通过 embedding)
+            - dense: 仅使用基础特征 (无统计特征，模拟"dense"行为)
+            - all: 使用基础特征 + 统计特征分桶版本 (与 sparse 相同)
+            - None: 保持 config 原样
+
+    Returns:
+        修改后的配置字典
+    """
+    if feature_mode is None:
+        logger.info("[Feature Selection] 未指定 feature_mode，使用 config 默认配置")
+        return config
+
+    fields = config.get("fields", {})
+
+    # 统计特征的 bucket 版本（与 step4 生成的 schema 对应）
+    stat_bucket_features = {
+        "pre_ctr_bucket": "cand_pre_ctr_bucket",
+        "pre_lv_rate_bucket": "cand_pre_lv_rate_bucket",
+        "pre_like_rate_bucket": "cand_pre_like_rate_bucket",
+        "pre_play_ratio_bucket": "cand_pre_play_ratio_bucket",
+        "pre_show_bucket": "cand_pre_show_bucket",
+    }
+
+    if feature_mode == "sparse":
+        logger.info("[Feature Selection] 模式=sparse: 添加统计特征分桶版本")
+        # 添加统计特征 bucket 版本到 cand_cols
+        for key, val in stat_bucket_features.items():
+            if key not in fields.get("cand_cols", {}):
+                fields.setdefault("cand_cols", {})[key] = val
+                logger.info("  + cand_cols['%s'] = '%s'", key, val)
+
+    elif feature_mode == "dense":
+        logger.info("[Feature Selection] 模式=dense: 仅使用基础特征（无统计特征）")
+        # 移除所有统计 bucket 特征，只保留基础特征
+        original_cand = dict(fields.get("cand_cols", {}))
+        base_features = {"video_id", "author_id", "video_type", "upload_type", "duration_bucket"}
+        filtered_cand = {k: v for k, v in original_cand.items() if k in base_features}
+        removed = set(original_cand.keys()) - set(filtered_cand.keys())
+        fields["cand_cols"] = filtered_cand
+        if removed:
+            logger.info("  - 移除统计特征: %s", removed)
+
+    elif feature_mode == "all":
+        logger.info("[Feature Selection] 模式=all: 添加统计特征分桶版本")
+        # 添加统计特征 bucket 版本到 cand_cols
+        for key, val in stat_bucket_features.items():
+            if key not in fields.get("cand_cols", {}):
+                fields.setdefault("cand_cols", {})[key] = val
+                logger.info("  + cand_cols['%s'] = '%s'", key, val)
+
+    config["fields"] = fields
+    return config
+
+
+# ─────────────────────────────────────────────────────────────
+# Vocab Sizes 加载
+# ─────────────────────────────────────────────────────────────
+
+def load_vocab_sizes(config: dict) -> Dict[str, int]:
+    """
+    从 field_schema.json 的 vocab_sizes 字段读取各 vocab 的大小。
+    """
+    meta_root = config["data"]["meta_root"]
+    schema_file = Path(meta_root) / config["data"]["field_schema_file"]
+
+    if not schema_file.exists():
+        raise FileNotFoundError(f"field_schema 文件不存在: {schema_file}")
+
+    with open(schema_file, "r", encoding="utf-8") as f:
+        schema = json.load(f)
+
+    vocab_sizes = schema.get("vocab_sizes", {})
+    if not vocab_sizes:
+        raise ValueError(f"field_schema.json 中未找到 vocab_sizes 字段: {schema_file}")
+
+    logger.info("已加载 vocab_sizes（共 %d 个 vocab）:", len(vocab_sizes))
+    for name, size in sorted(vocab_sizes.items()):
+        logger.info("  %-30s size=%d", name, size)
+
+    return vocab_sizes
+
+
+# ─────────────────────────────────────────────────────────────
+# DataLoader 构建
+# ─────────────────────────────────────────────────────────────
+
+def _worker_init_fn(worker_id: int):
+    """
+    DataLoader worker 初始化函数。
+    每个 worker 使用 torch 分配的不同种子初始化 numpy/random，避免 shuffle 重复。
+    """
+    import random
+    import numpy as np
+    seed = torch.initial_seed() % (2**32)
+    np.random.seed(seed)
+    random.seed(seed)
+
+
+def build_dataloader(
+    config: dict,
+    split: str,
+    shuffle: bool = False,
+    debug_rows: int = 0,
+) -> DataLoader:
+    """
+    构建指定 split 的 DataLoader。
+
+    Args:
+        config: 完整配置
+        split: 'train' / 'val' / 'test_standard' / 'test_random'
+        shuffle: 是否打乱
+        debug_rows: >0 时使用 DebugMapDataset
+
+    Returns:
+        DataLoader
+    """
+    data_cfg = config["data"]
+    fields_cfg = config["fields"]
+    dl_cfg = config.get("dataloader", {})
+    eval_cfg = config.get("eval", {})
+
+    # 文件路径
+    file_map = {
+        "train": data_cfg["train_file"],
+        "val": data_cfg["val_file"],
+        "test_standard": data_cfg["test_standard_file"],
+        "test_random": data_cfg["test_random_file"],
+    }
+    parquet_path = str(Path(data_cfg["data_root"]) / file_map[split])
+
+    if not Path(parquet_path).exists():
+        raise FileNotFoundError(f"Parquet 文件不存在: {parquet_path}")
+
+    # 解析列
+    is_train = (split == "train")
+    columns = resolve_columns(parquet_path, fields_cfg, is_train=is_train)
+    logger.info("[%s] 实际使用字段清单 (%d 列): %s", split, len(columns), columns)
+
+    # 选择 batch_size 和 workers
+    if is_train:
+        batch_size = config["training"]["batch_size"]
+        num_workers = dl_cfg.get("num_workers", 2)
+    else:
+        batch_size = eval_cfg.get("batch_size", dl_cfg.get("batch_size", 512))
+        num_workers = eval_cfg.get("num_workers", dl_cfg.get("num_workers", 2))
+
+    max_hist_len = config["model"]["max_hist_len"]
+
+    if debug_rows > 0:
+        from src.datasets.parquet_iterable_dataset import DebugMapDataset
+        collate_fn = SampleCollateFn(user_dense_cols=fields_cfg["user_dense_cols"])
+        dataset = DebugMapDataset(
+            parquet_path=parquet_path,
+            columns=columns,
+            max_rows=debug_rows,
+            max_hist_len=max_hist_len,
+        )
+        return DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            num_workers=0,  # DebugMapDataset 通常不需要多 worker
+            collate_fn=collate_fn,
+            pin_memory=dl_cfg.get("pin_memory", False),
+        )
+
+    # ── 默认：IterableDataset（预组装 batch）──
+    # Dataset 内部已按 batch_size 切分，yield dict[str, np.ndarray]
+    # DataLoader 使用 batch_size=None 直接透传
+    if os.name == "nt" and num_workers > 0:
+        logger.warning(
+            "Windows + 预组装 batch 场景下，num_workers>0 常因进程间传输开销导致变慢；"
+            "已自动回退为 num_workers=0。"
+        )
+        num_workers = 0
+
+    dataset = ParquetIterableDataset(
+        parquet_path=parquet_path,
+        columns=columns,
+        batch_size=batch_size,  # 传给 Dataset，内部预组装 batch
+        max_hist_len=max_hist_len,
+        shuffle=shuffle,
+        base_seed=config.get("seed", 42),
+    )
+
+    # BatchCollateFn 只做 numpy→tensor（零 Python 循环）
+    collate_fn = BatchCollateFn(
+        user_dense_cols=fields_cfg["user_dense_cols"],
+        float_columns=dataset.float_columns,
+    )
+
+    loader = DataLoader(
+        dataset,
+        batch_size=None,  # Dataset 已预组装 batch
+        num_workers=num_workers,
+        collate_fn=collate_fn,  # type: ignore[arg-type]
+        pin_memory=dl_cfg.get("pin_memory", True) and torch.cuda.is_available(),
+        prefetch_factor=dl_cfg.get("prefetch_factor", 2) if num_workers > 0 else None,
+        worker_init_fn=_worker_init_fn if num_workers > 0 else None,
+        persistent_workers=num_workers > 0,
+    )
+
+    return loader
+
+
+# ─────────────────────────────────────────────────────────────
+# 设备选择
+# ─────────────────────────────────────────────────────────────
+
+def get_device(config: dict) -> torch.device:
+    dev_str = config.get("device", "auto")
+    if dev_str == "auto":
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+            name = torch.cuda.get_device_name(0)
+            mem = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+            logger.info("使用 GPU: %s (%.1f GB)", name, mem)
+        else:
+            device = torch.device("cpu")
+            logger.info("CUDA 不可用，使用 CPU")
+    else:
+        device = torch.device(dev_str)
+        logger.info("使用设备: %s", device)
+    return device
+
+
+# ─────────────────────────────────────────────────────────────
+# 优化器构建
+# ─────────────────────────────────────────────────────────────
+
+def build_optimizer(model: torch.nn.Module, config: dict) -> torch.optim.Optimizer:
+    tcfg = config["training"]
+    opt_name = tcfg.get("optimizer", "adam").lower()
+    lr = tcfg["learning_rate"]
+    wd = tcfg.get("weight_decay", 0.0)
+
+    if opt_name == "adamw":
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
+    else:
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
+
+    logger.info("优化器: %s (lr=%.6f, weight_decay=%.2e)", opt_name, lr, wd)
+    return optimizer
+
+
+# ─────────────────────────────────────────────────────────────
+# 主流程
+# ─────────────────────────────────────────────────────────────
+
+def main():
+    args = parse_args()
+
+    # ── 日志设置 ──
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+        handlers=[logging.StreamHandler(sys.stdout)],
+    )
+
+    # ── 加载配置 ──
+    config = load_config(args)
+
+    # ── 特征选择（根据 feature_mode 动态调整 fields）──
+    config = apply_feature_selection(config, args.feature_mode)
+
+    run_dir = config["run_dir"]
+    os.makedirs(run_dir, exist_ok=True)
+
+    # 同时写日志到文件
+    fh = logging.FileHandler(os.path.join(run_dir, "train.log"), encoding="utf-8")
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(logging.Formatter("%(asctime)s [%(name)s] %(levelname)s: %(message)s"))
+    logging.getLogger().addHandler(fh)
+
+    logger.info("=" * 70)
+    logger.info("DIN Baseline 训练启动")
+    logger.info("实验目录: %s", run_dir)
+    logger.info(
+        "模型配置: variant=%s | psrg.enabled=%s | pcrg.enabled=%s | pcrg.num_queries=%s | "
+        "pcrg.aggregation=%s | tf.enabled=%s | tf.input=%s | tf.layers=%s | tf.heads=%s | tf.fusion_mode=%s",
+        config.get("model", {}).get("variant", "din"),
+        config.get("model", {}).get("psrg", {}).get("enabled", False),
+        config.get("model", {}).get("pcrg", {}).get("enabled", False),
+        config.get("model", {}).get("pcrg", {}).get("num_queries", "-"),
+        config.get("model", {}).get("pcrg", {}).get("aggregation", "-"),
+        config.get("model", {}).get("transformer_fusion", {}).get("enabled", False),
+        config.get("model", {}).get("transformer_fusion", {}).get("fusion_input", "-"),
+        config.get("model", {}).get("transformer_fusion", {}).get("n_layers", "-"),
+        config.get("model", {}).get("transformer_fusion", {}).get("n_heads", "-"),
+        config.get("model", {}).get("transformer_fusion", {}).get("fusion_mode", "-"),
+    )
+    logger.info(
+        "Head 配置: type=%s | mbcnet(fgc/lr/deep)=%s/%s/%s | fusion=%s",
+        config.get("model", {}).get("head", {}).get("type", "mlp"),
+        config.get("model", {}).get("head", {}).get("mbcnet", {}).get("enable_fgc", "-"),
+        config.get("model", {}).get("head", {}).get("mbcnet", {}).get("enable_lowrank_cross", "-"),
+        config.get("model", {}).get("head", {}).get("mbcnet", {}).get("enable_deep", "-"),
+        config.get("model", {}).get("head", {}).get("mbcnet", {}).get("fusion", {}).get("mode", "-"),
+    )
+    logger.info(
+        "PPNet 配置: enabled=%s | mode=%s | apply_to=%s | use_time=%s | use_user_dense=%s | "
+        "use_hist_len=%s | use_user_active_proxy=%s",
+        config.get("model", {}).get("ppnet", {}).get("enabled", False),
+        config.get("model", {}).get("ppnet", {}).get("mode", "-"),
+        config.get("model", {}).get("ppnet", {}).get("apply_to", "-"),
+        config.get("model", {}).get("ppnet", {}).get("context", {}).get("use_time_features", "-"),
+        config.get("model", {}).get("ppnet", {}).get("context", {}).get("use_user_dense", "-"),
+        config.get("model", {}).get("ppnet", {}).get("context", {}).get("use_hist_len", "-"),
+        config.get("model", {}).get("ppnet", {}).get("context", {}).get("use_user_active_proxy", "-"),
+    )
+    logger.info("=" * 70)
+
+    # 保存配置快照
+    save_config_snapshot(config, run_dir)
+
+    # ── 随机种子 ──
+    set_seed(config.get("seed", 42))
+
+    # ── 设备 ──
+    device = get_device(config)
+
+    # ── Vocab Sizes ──
+    vocab_sizes = load_vocab_sizes(config)
+
+    # ── 模型 ──
+    model = DINModel(config, vocab_sizes).to(device)
+
+    # ── DataLoader ──
+    debug_rows = args.debug_rows
+    logger.info("构建 DataLoader...")
+
+    train_loader = build_dataloader(config, "train", shuffle=True, debug_rows=debug_rows)
+    val_loader = build_dataloader(config, "val", shuffle=False, debug_rows=debug_rows)
+
+    # 预估 batch 数（用于进度条）
+    def est_batches(split_name: str, batch_size: int) -> Optional[int]:
+        """估算 batch 数量。"""
+        file_map = {
+            "train": config["data"]["train_file"],
+            "val": config["data"]["val_file"],
+            "test_standard": config["data"]["test_standard_file"],
+            "test_random": config["data"]["test_random_file"],
+        }
+        path = Path(config["data"]["data_root"]) / file_map[split_name]
+        import pyarrow.parquet as pq
+        try:
+            n = pq.ParquetFile(str(path)).metadata.num_rows
+            return math.ceil(n / batch_size)
+        except Exception:
+            return None
+
+    train_est = est_batches("train", config["training"]["batch_size"])
+    val_est = est_batches("val", config.get("eval", {}).get("batch_size", 512))
+
+    # ── Sanity Check ──
+    sanity_check_forward(model, val_loader, device, config)
+
+    if args.eval_only:
+        # 仅评估模式
+        logger.info("== Eval Only 模式 ==")
+        load_checkpoint(model, run_dir, device=device)
+        _run_final_eval(model, config, device, run_dir, debug_rows)
+        return
+
+    # ── 训练 ──
+    optimizer = build_optimizer(model, config)
+    criterion = torch.nn.BCEWithLogitsLoss()
+    _use_scaler = config["training"]["use_amp"] and device.type == "cuda" and config["training"].get("amp_dtype", "float16") != "bfloat16"
+    scaler = GradScaler(enabled=_use_scaler)
+
+    tcfg = config["training"]
+    best_metric_val = None
+    patience_counter = 0
+    global_step = 0
+
+    for epoch in range(tcfg["epochs"]):
+        # 为 IterableDataset 设置 epoch（影响 shuffle 种子）
+        if hasattr(train_loader.dataset, "set_epoch"):
+            getattr(train_loader.dataset, "set_epoch")(epoch)
+
+        # 重置 collate 打印标记
+        reset_collate_print_flag()
+
+        # ── 训练 ──
+        avg_loss, global_step = train_one_epoch(
+            model=model,
+            dataloader=train_loader,
+            optimizer=optimizer,
+            criterion=criterion,
+            device=device,
+            config=config,
+            scaler=scaler,
+            global_step=global_step,
+            epoch=epoch,
+            total_batches_est=train_est,
+        )
+
+        # ── 验证 ──
+        val_metrics = evaluate(
+            model=model,
+            dataloader=val_loader,
+            device=device,
+            config=config,
+            split_name="val",
+            total_batches_est=val_est,
+        )
+
+        # ── 指标比较与 checkpoint ──
+        monitor = tcfg["monitor_metric"]
+        current_val = val_metrics[monitor]
+
+        if is_better(current_val, best_metric_val, monitor):
+            logger.info(
+                "指标提升: %s %.6f → %.6f，保存 checkpoint",
+                monitor,
+                best_metric_val if best_metric_val is not None else 0.0,
+                current_val,
+            )
+            best_metric_val = current_val
+            save_checkpoint(model, optimizer, epoch, global_step, val_metrics, run_dir)
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            logger.info(
+                "指标未提升 (%s=%.6f, best=%.6f), patience=%d/%d",
+                monitor, current_val, best_metric_val, patience_counter, tcfg["patience"],
+            )
+            if patience_counter >= tcfg["patience"]:
+                logger.info("Early stopping 触发！")
+                break
+
+    # ── 加载 best checkpoint 进行最终评估 ──
+    logger.info("=" * 70)
+    logger.info("训练完成，加载 best checkpoint 进行 test 评估...")
+    load_checkpoint(model, run_dir, device=device)
+    _run_final_eval(model, config, device, run_dir, debug_rows)
+
+
+def _run_final_eval(model, config, device, run_dir, debug_rows):
+    """在 val / test_standard / test_random 上运行最终评估。"""
+    all_results = {}
+
+    for split in ["val", "test_standard", "test_random"]:
+        logger.info("─" * 40)
+        logger.info("评估 %s ...", split)
+
+        loader = build_dataloader(config, split, shuffle=False, debug_rows=debug_rows)
+        bs = config.get("eval", {}).get("batch_size", 512)
+        est = None
+        try:
+            import pyarrow.parquet as pq
+            path = Path(config["data"]["data_root"]) / config["data"][f"{split}_file"]
+            est = math.ceil(pq.ParquetFile(str(path)).metadata.num_rows / bs)
+        except Exception:
+            pass
+
+        reset_collate_print_flag()
+        metrics = evaluate(
+            model=model,
+            dataloader=loader,
+            device=device,
+            config=config,
+            split_name=split,
+            total_batches_est=est,
+        )
+        all_results[split] = metrics
+
+    # 汇总打印
+    logger.info("=" * 70)
+    logger.info("最终评估结果汇总:")
+    logger.info("%-20s %10s %10s %10s %10s", "Split", "AUC", "LogLoss", "GAUC", "N")
+    for split, m in all_results.items():
+        logger.info(
+            "%-20s %10.6f %10.6f %10.6f %10d",
+            split, m["auc"], m["logloss"], m["gauc"], m["n_samples"],
+        )
+    logger.info("=" * 70)
+
+    # 保存
+    save_final_metrics(all_results, run_dir)
+
+
+# ─────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,130 @@
+# KuaiRand-27K 特征配置文件
+# 修改此文件即可灵活调整输入特征，无需修改代码
+
+# ============================================================
+# 物品统计特征配置 (Step 2 生成)
+# ============================================================
+item_statistics:
+  # 是否启用该特征
+  pre_ctr:
+    enable: true
+    sparse:
+      enable: true        # 是否生成分桶版 (sparse)
+      bucket_strategy: "smart_zero"  # 分桶策略: smart_zero / uniform / fixed
+      n_buckets: 3        # 桶数 (不含PAD)
+    dense:
+      enable: true        # 是否生成原始值版 (dense)
+      transform: "raw"    # 变换方式: raw / log1p / sqrt
+
+  pre_lv_rate:
+    enable: true
+    sparse:
+      enable: true
+      bucket_strategy: "smart_zero"
+      n_buckets: 3
+    dense:
+      enable: true
+      transform: "raw"
+
+  pre_like_rate:
+    enable: true
+    sparse:
+      enable: true
+      bucket_strategy: "smart_zero"
+      n_buckets: 3
+    dense:
+      enable: true
+      transform: "raw"
+
+  pre_play_ratio:
+    enable: true
+    sparse:
+      enable: true
+      bucket_strategy: "uniform"  # 分布均匀，不需要特殊处理0
+      n_buckets: 5
+    dense:
+      enable: true
+      transform: "raw"
+
+  pre_show_cnt:
+    enable: true
+    sparse:
+      enable: true
+      bucket_strategy: "smart_zero"
+      n_buckets: 4
+    dense:
+      enable: true
+      transform: "log1p"   # 曝光数用log1p压缩
+
+# ============================================================
+# 基础特征配置 (必须启用)
+# ============================================================
+base_features:
+  # 候选视频特征 (cand_cols)
+  cand_video_id: { enable: true, type: "id" }
+  cand_author_id: { enable: true, type: "id" }
+  cand_video_type: { enable: true, type: "category" }
+  cand_upload_type: { enable: true, type: "category" }
+  cand_video_duration_bucket: { enable: true, type: "bucket" }
+
+  # 上下文特征 (context_sparse_cols)
+  tab: { enable: true, type: "category" }
+  hour_of_day: { enable: true, type: "bucket", n_buckets: 24 }
+  day_of_week: { enable: true, type: "bucket", n_buckets: 7 }
+  is_weekend: { enable: true, type: "binary" }
+
+  # 用户sparse特征 (user_sparse_cols)
+  user_active_degree: { enable: true, type: "category" }
+  is_lowactive_period: { enable: true, type: "binary" }
+  is_live_streamer: { enable: true, type: "binary" }
+  is_video_author: { enable: true, type: "binary" }
+  follow_user_num_range: { enable: true, type: "category" }
+  fans_user_num_range: { enable: true, type: "category" }
+  friend_user_num_range: { enable: true, type: "category" }
+  register_days_range: { enable: true, type: "category" }
+  onehot_feat0: { enable: true, type: "category" }
+  onehot_feat1: { enable: true, type: "category" }
+  onehot_feat2: { enable: true, type: "category" }
+  onehot_feat3: { enable: true, type: "category" }
+  onehot_feat4: { enable: true, type: "category" }
+  onehot_feat5: { enable: true, type: "category" }
+  onehot_feat6: { enable: true, type: "category" }
+  onehot_feat7: { enable: true, type: "category" }
+  onehot_feat8: { enable: true, type: "category" }
+  onehot_feat9: { enable: true, type: "category" }
+  onehot_feat10: { enable: true, type: "category" }
+  onehot_feat11: { enable: true, type: "category" }
+  onehot_feat12: { enable: true, type: "category" }
+  onehot_feat13: { enable: true, type: "category" }
+  onehot_feat14: { enable: true, type: "category" }
+  onehot_feat15: { enable: true, type: "category" }
+  onehot_feat16: { enable: true, type: "category" }
+  onehot_feat17: { enable: true, type: "category" }
+
+  # 用户dense特征 (user_dense_cols)
+  log1p_follow_user_num: { enable: true, type: "log1p" }
+  log1p_fans_user_num: { enable: true, type: "log1p" }
+  log1p_friend_user_num: { enable: true, type: "log1p" }
+  log1p_register_days: { enable: true, type: "log1p" }
+
+  # 历史序列特征
+  hist_video_id: { enable: true, type: "seq_id" }
+  hist_author_id: { enable: true, type: "seq_id" }
+  hist_delta_t_bucket: { enable: true, type: "seq_bucket" }
+  hist_play_ratio_bucket: { enable: true, type: "seq_bucket" }
+  hist_tab: { enable: true, type: "seq_category" }
+
+# ============================================================
+# 输出配置
+# ============================================================
+output:
+  # 是否同时生成两种版本供选择
+  generate_both_versions: true
+
+  # 默认使用的特征版本 (sparse / dense / both)
+  default_version: "both"
+
+  # field_schema.json 生成策略
+  # "config": 严格按此配置文件生成
+  # "auto": 自动检测parquet中的列生成
+  schema_strategy: "config"

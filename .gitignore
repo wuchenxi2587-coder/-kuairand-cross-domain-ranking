@@ -1,0 +1,78 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions / shared objects
+*.so
+*.pyd
+*.dll
+
+# Distribution / packaging
+.Python
+build/
+dist/
+.eggs/
+*.egg-info/
+pip-wheel-metadata/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Testing / tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.coverage
+.coverage.*
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE / editor
+.vscode/
+.idea/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs and temp files
+logs/
+logs2/
+*.log
+*.tmp
+*.bak
+
+# Local env vars / secrets
+.env
+.env.*
+
+# Large raw datasets (do not commit to GitHub)
+data/
+KuaiRand-27K/
+
+# Legacy directories (pending deletion, locked by IDE)
+din_baseline/
+
+# Pipeline outputs
+output/
+output_test/
+
+# EDA generated artifacts (can regenerate)
+reports/eda_report/figures/
+reports/eda_report/tables/
+
+# Local databases
+*.sqlite
+*.db
