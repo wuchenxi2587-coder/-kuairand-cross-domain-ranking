@@ -69,6 +69,11 @@ din_baseline/
 output/
 output_test/
 
+# Reports (internal / interview materials)
+reports/interview/
+reports/full_project_report.md
+reports/pipeline_detailed_operations.md
+
 # EDA generated artifacts (can regenerate)
 reports/eda_report/figures/
 reports/eda_report/tables/
