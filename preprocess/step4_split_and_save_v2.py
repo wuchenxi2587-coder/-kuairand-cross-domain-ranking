@@ -16,7 +16,7 @@ from pathlib import Path
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-OUTPUT_DIR = "/111111/newproject/output"
+OUTPUT_DIR = "output"
 
 # 严格匹配 README 的样本比例：train 70%, val 10%, test 20%
 TRAIN_RATIO = 0.70

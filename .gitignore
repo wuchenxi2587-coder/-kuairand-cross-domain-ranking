@@ -75,8 +75,8 @@ reports/full_project_report.md
 reports/pipeline_detailed_operations.md
 
 # EDA generated artifacts (can regenerate)
-reports/eda_report/figures/
-reports/eda_report/tables/
+reports/eda_report/
+notebooks/
 
 # Local databases
 *.sqlite

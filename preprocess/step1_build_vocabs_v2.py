@@ -13,8 +13,8 @@ import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-DATA_DIR = "/111111/newproject/data/KuaiRand-27K"
-OUTPUT_DIR = "/111111/newproject/output"
+DATA_DIR = "data/KuaiRand-27K"
+OUTPUT_DIR = "output"
 
 def build_category_vocab(unique_vals, name):
     """构建类别词表，处理各种异常值"""
